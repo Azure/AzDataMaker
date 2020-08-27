@@ -18,7 +18,7 @@ The goal of this app is to generate files and upload them to Azure Blob Storage.
 
 > NOTE: AzCopy has a "benchmark" feature, [more info here](https://docs.microsoft.com/azure/storage/common/storage-ref-azcopy-bench). AzCopy Benchmark is designed to run a performance benchmark by uploading or downloading test data to or from a specified destination. We recommend using AzCopy for running performance benchmarks. This sample is designed to create massive quantities of data, leveraging the horizontal scale of the Azure Container Instance service.
 
-## Repository Contents
+## Repository Content
 
 | File/folder | Description |
 |-------------|-------------|
