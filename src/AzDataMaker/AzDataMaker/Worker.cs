@@ -28,7 +28,6 @@ namespace AzDataMaker
         private readonly string _name;
         private readonly ILogger<Worker> _logger;
         private readonly ConfigHelper _config;
-        private readonly Random _random;
         private readonly IHostApplicationLifetime _hostApplicationLifetime;
         private readonly BlobServiceClient _blobServiceClient;
       
@@ -36,15 +35,13 @@ namespace AzDataMaker
         public Worker(ILogger<Worker> logger,
             IHostApplicationLifetime hostApplicationLifetime,
             BlobServiceClient blobServiceClient,
-            ConfigHelper config,
-            Random random)
+            ConfigHelper config)
         {
             _name = this.GetType().Name;
             _logger = logger;
             _hostApplicationLifetime = hostApplicationLifetime;
             _blobServiceClient = blobServiceClient;
             _config = config;
-            _random = random;
         }
 
 
@@ -136,9 +133,11 @@ namespace AzDataMaker
 
             // Max File Size (in MiB)
             int maxFileSizeMiB = _config.GetConfigValue("MaxFileSize", 100);
+            long maxFileSizeBytes = maxFileSizeMiB * MiB;
 
             // Min File Size (in MiB)
             int minFileSizeMiB = _config.GetConfigValue("MinFileSize", 4);
+            long minFileSizeBytes = minFileSizeMiB * MiB;
 
             // How often should I log progress on the upload (in num of files)?
             int statusIncrement = _config.GetConfigValue("ReportStatusIncrement", 1000);
@@ -152,87 +151,125 @@ namespace AzDataMaker
 
             var uploads = new List<Task>();
 
-            for (int fileNum = 0; fileNum < fileCount; fileNum++)
+            for (int fileNumber = 0; fileNumber < fileCount; fileNumber++)
             {
-
                 slim.Wait();
-
-                int blobContainerIndex = (fileCount - fileNum) % containerCount;
-                string fileName = $"{Guid.NewGuid().ToString().ToLower()}.dat";
-                long fileSizeInBytes = _random.NextLong(minFileSizeMiB * MiB, maxFileSizeMiB * MiB);
-                long currentByteIndex = 0;
-                int defaultChunkSizeInBytes = 8 * MiB;
-
-                // create the file on the local disk
-                // sending it to the disk to allow for creating larger files and
-                // not using all the memory
-                if (randomFileContents)
+                var fileNum = fileNumber;
+                uploads.Add(Task.Run(async () => 
                 {
-                    // create using the random function in .NET
+                    var random = new Random();
+                    int blobContainerIndex = (fileCount - fileNum) % containerCount;
+                    string fileName = $"{Guid.NewGuid().ToString().ToLower()}.dat";
+                    long fileSizeInBytes = random.NextLong(minFileSizeBytes, maxFileSizeBytes);
+                    long chunkSize = 4 * MiB;
+
+                    //A blobClent we are going to use to upload
+                    var blobClient = blobContainerClients[blobContainerIndex].GetBlockBlobClient(fileName);
+
+                    _logger.LogDebug($"Starting File {fileNum:N0} of {fileSizeInBytes:N0} bytes PutBlob {fileSizeInBytes < blobClient.BlockBlobMaxUploadBlobBytes} ");
+
+
                     using (FileStream fs = File.OpenWrite(fileName))
                     {
-                        while (fileSizeInBytes > currentByteIndex)
+                        foreach (var chunk in GetChunks(fileSizeInBytes, chunkSize, randomFileContents))
                         {
-                            byte[] block = new byte[Math.Min(defaultChunkSizeInBytes, fileSizeInBytes - currentByteIndex)];
-                            _random.NextBytes(block);
-                            fs.Write(block, 0, block.Length);
-                            currentByteIndex += block.Length;
+                            fs.Write(chunk, 0, chunk.Length);
                         }
                     }
-                }
-                else
-                {
-                    // create with an empty file
-                    using (FileStream fs = File.OpenWrite(fileName))
+
+                    // Get a hash of our file
+                    // We are reading the file back to emulate what might happen in a real app
+                    var hash = string.Empty;
+                    using (FileStream fs = File.OpenRead(fileName))
                     {
-                        fs.SetLength(fileSizeInBytes);
+                        hash = Convert.ToBase64String(md5.ComputeHash(fs));
                     }
-                }
 
-                // Get a hash of our file
-                // We are reading the file back to emulate what might happen in a real app
-                var hash = string.Empty;
-                using (FileStream fs = File.OpenRead(fileName))
-                {
-                    hash = Convert.ToBase64String(md5.ComputeHash(fs));
-                }
+                    var metadata = new Dictionary<string, string>()
+                    {
+                        { "Md5Hash", hash },
+                        { "Randomized", randomFileContents.ToString() },
+                        { "FileNum", fileNum.ToString() },
+                        { "FileSize", fileSizeInBytes.ToString() }
+                    };
 
-                //A blobClent we are going to use to upload
-                var blobClient = blobContainerClients[blobContainerIndex].GetBlobClient(fileName);
 
-                var metadata = new Dictionary<string, string>()
-                {
-                    { "Md5Hash", hash },
-                    { "Randomized", randomFileContents.ToString() },
-                    { "FileNum", fileNum.ToString() }
-                };
-
-                //Upload the file and its metadata, then clean up and report status
-                uploads.Add(blobClient.UploadAsync(fileName, metadata: metadata, cancellationToken: cancellationToken)
-                    .ContinueWith(x => {
-                        
-                        File.Delete(fileName);
-
-                        Interlocked.Increment(ref completedFiles);
-                        Interlocked.Add(ref completedBytes, fileSizeInBytes);
-
-                        if (completedFiles % statusIncrement == 0)
+                    if (fileSizeInBytes > (long)blobClient.BlockBlobMaxStageBlockBytes * (long)blobClient.BlockBlobMaxBlocks)
+                    {
+                        throw new ArgumentOutOfRangeException($"File Too Big {fileSizeInBytes:N0} > {blobClient.BlockBlobMaxStageBlockBytes * blobClient.BlockBlobMaxBlocks}");
+                    }
+                    else if (fileSizeInBytes < blobClient.BlockBlobMaxUploadBlobBytes)
+                    {
+                        using (var stream = File.OpenRead(fileName))
                         {
-                            var pctComplete = (completedFiles / (double)fileCount);
-                            var mbps = (completedBytes / MiB / stopwatch.Elapsed.TotalSeconds) * 8;
-                            var eta = TimeSpan.FromSeconds((stopwatch.Elapsed.TotalSeconds / completedFiles) * (fileCount - completedFiles));
-                            _logger.LogInformation($"Processed file {completedFiles:N0} of {fileCount:N0} ({pctComplete * 100:N1}%) after {stopwatch.Elapsed:ddd\\.hh\\:mm\\:ss} ({mbps:N} Mbps) estimated in {eta:ddd\\.hh\\:mm\\:ss}");
+                            await blobClient.UploadAsync(stream, metadata: metadata, cancellationToken: cancellationToken);
+                        }
+                    }
+                    else
+                    {
+                        var blockSize = Math.Max(chunkSize, fileSizeInBytes / blobClient.BlockBlobMaxBlocks);
+                        byte[] buffer = new byte[blockSize];
+
+                        var blockList = new List<string>();
+
+                        using (var stream = File.OpenRead(fileName))
+                        {
+                            int readAmount = await stream.ReadAsync(buffer, 0, buffer.Length);
+
+                            while (readAmount != 0)
+                            {
+                                var blockId = Convert.ToBase64String(Guid.NewGuid().ToByteArray());
+                                blockList.Add(blockId);
+                                await blobClient.StageBlockAsync(blockId, new MemoryStream(buffer), cancellationToken: cancellationToken);
+
+                                readAmount = await stream.ReadAsync(buffer, 0, buffer.Length);
+                            }
                         }
 
-                        slim.Release();
-                    }));
-                
+                        await blobClient.CommitBlockListAsync(blockList, metadata: metadata, cancellationToken: cancellationToken);
+                    }
+
+                    File.Delete(fileName);
+
+                    Interlocked.Increment(ref completedFiles);
+                    Interlocked.Add(ref completedBytes, fileSizeInBytes);
+
+                    if (completedFiles % statusIncrement == 0)
+                    {
+                        var pctComplete = (completedFiles / (double)fileCount);
+                        var mbps = (completedBytes / MiB / stopwatch.Elapsed.TotalSeconds) * 8;
+                        var eta = TimeSpan.FromSeconds((stopwatch.Elapsed.TotalSeconds / completedFiles) * (fileCount - completedFiles));
+                        _logger.LogInformation($"Processed file {completedFiles:N0} of {fileCount:N0} ({pctComplete * 100:N1}%) after {stopwatch.Elapsed:ddd\\.hh\\:mm\\:ss} ({mbps:N} Mbps) estimated in {eta:ddd\\.hh\\:mm\\:ss}");
+                    }
+
+                    _logger.LogDebug($"Finished File {fileNum}");
+
+                    slim.Release();
+                }, cancellationToken));
             }
 
             Task.WaitAll(uploads.ToArray());
 
             _logger.LogInformation($"Processing Finished {fileCount:N0} files after {stopwatch.Elapsed:ddd\\.hh\\:mm\\:ss} ({(completedBytes / stopwatch.Elapsed.TotalSeconds) * 8:N} Mbps)");
         }
-        
+
+
+        private IEnumerable<byte[]> GetChunks(long fileSizeInBytes, long chunkSize, bool randomFileContents)
+        {
+            var random = new Random();
+            long currentByteIndex = 0;
+            while (fileSizeInBytes > currentByteIndex)
+            {
+                byte[] chunk = new byte[Math.Min(chunkSize, fileSizeInBytes - currentByteIndex)];
+
+                if (randomFileContents)
+                {
+                    random.NextBytes(chunk);
+                }
+
+                currentByteIndex += chunk.Length;
+                yield return chunk;
+            }
+        }
     }
 }

@@ -23,7 +23,6 @@ namespace AzDataMaker
                 .ConfigureServices((hostContext, services) =>
                 {
                     services.AddSingleton<ConfigHelper>();
-                    services.AddSingleton<Random>();
 
                     services.AddSingleton(x =>
                     {
