@@ -20,23 +20,31 @@ namespace AzDataMaker
 {
     public class Worker : BackgroundService
     {
+        private const int KiB = 1024;
+        private const int MiB = KiB * 1024;
+        private const int GiB = MiB * 1024;
+        private const long TiB = GiB * 1024L;
+
         private readonly string _name;
         private readonly ILogger<Worker> _logger;
+        private readonly ConfigHelper _config;
+        private readonly Random _random;
         private readonly IHostApplicationLifetime _hostApplicationLifetime;
-        private readonly IConfiguration _configuration;
         private readonly BlobServiceClient _blobServiceClient;
       
 
         public Worker(ILogger<Worker> logger,
             IHostApplicationLifetime hostApplicationLifetime,
-            IConfiguration configuration,
-            BlobServiceClient blobServiceClient)
+            BlobServiceClient blobServiceClient,
+            ConfigHelper config,
+            Random random)
         {
             _name = this.GetType().Name;
             _logger = logger;
             _hostApplicationLifetime = hostApplicationLifetime;
-            _configuration = configuration;
             _blobServiceClient = blobServiceClient;
+            _config = config;
+            _random = random;
         }
 
 
@@ -109,34 +117,33 @@ namespace AzDataMaker
         /// <returns></returns>
         private async Task RunAsync(CancellationToken cancellationToken)
         {
-            Random random = new Random();
             SemaphoreSlim slim = null;
             MD5 md5 = MD5.Create();
 
             // Target containers to round robin over
-            var blobContainerClients = await GetTargetContainersAsync(5, cancellationToken);
+            var blobContainerClients = await _config.GetTargetContainersAsync(5, cancellationToken);
             int containerCount = blobContainerClients.Count();
 
             // How many files should we create
-            int fileCount = GetConfigValue("FileCount", 100);
+            int fileCount = _config.GetConfigValue("FileCount", 100);
 
             // How many threads should we use
-            slim = new SemaphoreSlim(GetConfigValue("Threads", Environment.ProcessorCount * 2));
+            slim = new SemaphoreSlim(_config.GetConfigValue("Threads", Environment.ProcessorCount * 2));
 
             // How many files have we created
             int completedFiles = 0;
-            long completedMB = 0;
+            long completedBytes = 0;
 
-            // Max File Size (in MB)
-            int maxFileSize = GetConfigValue("MaxFileSize", 100);
+            // Max File Size (in MiB)
+            int maxFileSizeMiB = _config.GetConfigValue("MaxFileSize", 100);
 
-            // Min File Size (in MB)
-            int minFileSize = GetConfigValue("MinFileSize", 4);
+            // Min File Size (in MiB)
+            int minFileSizeMiB = _config.GetConfigValue("MinFileSize", 4);
 
             // How often should I log progress on the upload (in num of files)?
-            int statusIncrement = GetConfigValue("ReportStatusIncrement", 1000);
+            int statusIncrement = _config.GetConfigValue("ReportStatusIncrement", 1000);
 
-            bool randomFileContents = GetConfigValue("RandomFileContents", false);
+            bool randomFileContents = _config.GetConfigValue("RandomFileContents", false);
 
             var stopwatch = new Stopwatch();
             stopwatch.Start();
@@ -152,10 +159,9 @@ namespace AzDataMaker
 
                 int blobContainerIndex = (fileCount - fileNum) % containerCount;
                 string fileName = $"{Guid.NewGuid().ToString().ToLower()}.dat";
-                int fileSizeInMb = random.Next(minFileSize, maxFileSize);
-                long fileSizeInBytes = fileSizeInMb * 1024 * 1024;
-                int blockSize = 8 * 1024;
-                int blocksPerMb = (1024 * 1024) / blockSize;
+                long fileSizeInBytes = _random.NextLong(minFileSizeMiB * MiB, maxFileSizeMiB * MiB);
+                long currentByteIndex = 0;
+                int defaultChunkSizeInBytes = 8 * MiB;
 
                 // create the file on the local disk
                 // sending it to the disk to allow for creating larger files and
@@ -165,11 +171,12 @@ namespace AzDataMaker
                     // create using the random function in .NET
                     using (FileStream fs = File.OpenWrite(fileName))
                     {
-                        byte[] block = new byte[blockSize];
-                        for (int i = 0; i < fileSizeInMb * blocksPerMb; i++)
+                        while (fileSizeInBytes > currentByteIndex)
                         {
-                            random.NextBytes(block);
+                            byte[] block = new byte[Math.Min(defaultChunkSizeInBytes, fileSizeInBytes - currentByteIndex)];
+                            _random.NextBytes(block);
                             fs.Write(block, 0, block.Length);
+                            currentByteIndex += block.Length;
                         }
                     }
                 }
@@ -207,12 +214,12 @@ namespace AzDataMaker
                         File.Delete(fileName);
 
                         Interlocked.Increment(ref completedFiles);
-                        Interlocked.Add(ref completedMB, fileSizeInMb);
+                        Interlocked.Add(ref completedBytes, fileSizeInBytes);
 
                         if (completedFiles % statusIncrement == 0)
                         {
                             var pctComplete = (completedFiles / (double)fileCount);
-                            var mbps = (completedMB / stopwatch.Elapsed.TotalSeconds) * 8;
+                            var mbps = (completedBytes / MiB / stopwatch.Elapsed.TotalSeconds) * 8;
                             var eta = TimeSpan.FromSeconds((stopwatch.Elapsed.TotalSeconds / completedFiles) * (fileCount - completedFiles));
                             _logger.LogInformation($"Processed file {completedFiles:N0} of {fileCount:N0} ({pctComplete * 100:N1}%) after {stopwatch.Elapsed:ddd\\.hh\\:mm\\:ss} ({mbps:N} Mbps) estimated in {eta:ddd\\.hh\\:mm\\:ss}");
                         }
@@ -224,96 +231,8 @@ namespace AzDataMaker
 
             Task.WaitAll(uploads.ToArray());
 
-            _logger.LogInformation($"Processing Finished {fileCount:N0} files after {stopwatch.Elapsed:ddd\\.hh\\:mm\\:ss} ({(completedMB / stopwatch.Elapsed.TotalSeconds) * 8:N} Mbps)");
+            _logger.LogInformation($"Processing Finished {fileCount:N0} files after {stopwatch.Elapsed:ddd\\.hh\\:mm\\:ss} ({(completedBytes / stopwatch.Elapsed.TotalSeconds) * 8:N} Mbps)");
         }
-
-        /// <summary>
-        /// Helper to get int values from config
-        /// </summary>
-        /// <param name="key"></param>
-        /// <param name="defaultValue"></param>
-        /// <returns></returns>
-        private int GetConfigValue(string key, int defaultValue)
-        {
-            string configValue = _configuration[key];
-            int value;
-            if (!int.TryParse(configValue, out value))
-            {
-                value = defaultValue;
-            }
-            return value;
-        }
-
-        /// <summary>
-        /// Helper to get bool values from config
-        /// </summary>
-        /// <param name="key"></param>
-        /// <param name="defaultValue"></param>
-        /// <returns></returns>
-        private bool GetConfigValue(string key, bool defaultValue)
-        {
-            string configValue = _configuration[key];
-            bool value;
-            if (!bool.TryParse(configValue, out value))
-            {
-                value = defaultValue;
-            }
-            return value;
-        }
-
-
-        /// <summary>
-        /// Get the target container names from the config option "BlobContainers". 
-        /// 
-        /// The config option can be set with either:
-        /// 
-        ///  - An Integer representing the number of random conatiner names to use. 
-        ///    containers will be named with a GUID.
-        ///    
-        ///  - A comma separated list of container names to use. 
-        /// </summary>
-        /// <returns></returns>
-        private async Task<List<BlobContainerClient>> GetTargetContainersAsync(int defultNumber, CancellationToken cancellationToken)
-        {
-            var blobContainers = new List<BlobContainerClient>();
-
-            string blobContainerConfig = _configuration["BlobContainers"];
-            if (!string.IsNullOrEmpty(blobContainerConfig))
-            {
-                int containerCount = 0;
-                if (int.TryParse(blobContainerConfig, out containerCount))
-                {
-                    // If a number was specified create that many container names
-                    for (int i = 0; i < containerCount; i++)
-                    {
-                        blobContainers.Add(_blobServiceClient.GetBlobContainerClient(Guid.NewGuid().ToString().ToLower()));
-                    }
-                }
-                else
-                {
-                    // If container names were specified use them
-                    foreach (var name in blobContainerConfig.Split(",").Select(x => x.Trim()).Distinct())
-                    {
-                        blobContainers.Add(_blobServiceClient.GetBlobContainerClient(name));
-                    }
-                }
-            }
-            else
-            {
-                // create the default number of conatiners
-                for (int i = 0; i < defultNumber; i++)
-                {
-                    blobContainers.Add(_blobServiceClient.GetBlobContainerClient(Guid.NewGuid().ToString().ToLower()));
-                }
-            }
-
-            //Ensure all the containers exist
-            foreach (var container in blobContainers)
-            {
-                await container.CreateIfNotExistsAsync(cancellationToken: cancellationToken);
-            }
-
-            return blobContainers;
-        }
+        
     }
 }
