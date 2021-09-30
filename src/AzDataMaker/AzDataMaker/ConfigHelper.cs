@@ -1,5 +1,6 @@
 ﻿using Azure.Storage.Blobs;
 using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.Logging;
 using System;
 using System.Collections.Generic;
 using System.Linq;
@@ -13,10 +14,14 @@ namespace AzDataMaker
     {
         private readonly IConfiguration _configuration;
         private readonly BlobServiceClient _blobServiceClient;
+        private readonly ILogger<ConfigHelper> _logger;
 
-        public ConfigHelper(BlobServiceClient blobServiceClient, 
+
+        public ConfigHelper(ILogger<ConfigHelper> logger, 
+            BlobServiceClient blobServiceClient, 
             IConfiguration configuration)
         {
+            _logger = logger;
             _configuration = configuration;
             _blobServiceClient = blobServiceClient;
         }
@@ -35,6 +40,25 @@ namespace AzDataMaker
             {
                 value = defaultValue;
             }
+            _logger.LogInformation($"{key} = {configValue} - Default {defaultValue} - Used {value}");
+            return value;
+        }
+
+        /// <summary>
+        /// Helper to get int values from config
+        /// </summary>
+        /// <param name="key"></param>
+        /// <param name="defaultValue"></param>
+        /// <returns></returns>
+        public double GetConfigValue(string key, double defaultValue)
+        {
+            string configValue = _configuration[key];
+            double value;
+            if (!double.TryParse(configValue, out value))
+            {
+                value = defaultValue;
+            }
+            _logger.LogInformation($"{key} = {configValue} - Default {defaultValue} - Used {value}");
             return value;
         }
 
@@ -52,6 +76,7 @@ namespace AzDataMaker
             {
                 value = defaultValue;
             }
+            _logger.LogInformation($"{key} = {configValue} - Default {defaultValue} - Used {value}");
             return value;
         }
 
@@ -77,6 +102,7 @@ namespace AzDataMaker
                 if (int.TryParse(blobContainerConfig, out containerCount))
                 {
                     // If a number was specified create that many container names
+                    _logger.LogInformation($"Creating {containerCount} Containers");
                     for (int i = 0; i < containerCount; i++)
                     {
                         blobContainers.Add(_blobServiceClient.GetBlobContainerClient(Guid.NewGuid().ToString().ToLower()));
@@ -85,6 +111,7 @@ namespace AzDataMaker
                 else
                 {
                     // If container names were specified use them
+                    _logger.LogInformation($"Creating Containers named {blobContainerConfig}");
                     foreach (var name in blobContainerConfig.Split(",").Select(x => x.Trim()).Distinct())
                     {
                         blobContainers.Add(_blobServiceClient.GetBlobContainerClient(name));
@@ -94,6 +121,7 @@ namespace AzDataMaker
             else
             {
                 // create the default number of conatiners
+                _logger.LogInformation($"Creating Default {defultNumber} Containers");
                 for (int i = 0; i < defultNumber; i++)
                 {
                     blobContainers.Add(_blobServiceClient.GetBlobContainerClient(Guid.NewGuid().ToString().ToLower()));

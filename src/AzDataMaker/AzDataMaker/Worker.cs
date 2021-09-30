@@ -132,12 +132,12 @@ namespace AzDataMaker
             long completedBytes = 0;
 
             // Max File Size (in MiB)
-            int maxFileSizeMiB = _config.GetConfigValue("MaxFileSize", 100);
-            long maxFileSizeBytes = maxFileSizeMiB * MiB;
+            double maxFileSizeMiB = _config.GetConfigValue("MaxFileSize", 100.0);
+            long maxFileSizeBytes = (long)(maxFileSizeMiB * MiB);
 
             // Min File Size (in MiB)
-            int minFileSizeMiB = _config.GetConfigValue("MinFileSize", 4);
-            long minFileSizeBytes = minFileSizeMiB * MiB;
+            double minFileSizeMiB = _config.GetConfigValue("MinFileSize", 4.0);
+            long minFileSizeBytes = (long)(minFileSizeMiB * MiB);
 
             // How often should I log progress on the upload (in num of files)?
             int statusIncrement = _config.GetConfigValue("ReportStatusIncrement", 1000);
@@ -166,7 +166,7 @@ namespace AzDataMaker
                     //A blobClent we are going to use to upload
                     var blobClient = blobContainerClients[blobContainerIndex].GetBlockBlobClient(fileName);
 
-                    _logger.LogDebug($"Starting File {fileNum:N0} of {fileSizeInBytes:N0} bytes PutBlob {fileSizeInBytes < blobClient.BlockBlobMaxUploadBlobBytes} ");
+                    _logger.LogDebug($"Starting File {fileNum:N0} of {fileSizeInBytes:N0} bytes UploadAsync {fileSizeInBytes < blobClient.BlockBlobMaxUploadBlobBytes} ");
 
 
                     using (FileStream fs = File.OpenWrite(fileName))
@@ -193,11 +193,12 @@ namespace AzDataMaker
                         { "FileSize", fileSizeInBytes.ToString() }
                     };
 
-
+                    // file is too big for blob storage
                     if (fileSizeInBytes > (long)blobClient.BlockBlobMaxStageBlockBytes * (long)blobClient.BlockBlobMaxBlocks)
                     {
                         throw new ArgumentOutOfRangeException($"File Too Big {fileSizeInBytes:N0} > {blobClient.BlockBlobMaxStageBlockBytes * blobClient.BlockBlobMaxBlocks}");
                     }
+                    // file is small enough to upload via UploadAsync
                     else if (fileSizeInBytes < blobClient.BlockBlobMaxUploadBlobBytes)
                     {
                         using (var stream = File.OpenRead(fileName))
@@ -205,24 +206,54 @@ namespace AzDataMaker
                             await blobClient.UploadAsync(stream, metadata: metadata, cancellationToken: cancellationToken);
                         }
                     }
+                    // file is too big to upload via UploadAsync, need to break into blocks and upload individually
+                    //   we do this by reading the source file and writing each block to a new file
+                    //   while this creates more IO to the disk, it will handle files of any size
+                    //   without using GBs or more of memory
                     else
                     {
                         var blockSize = Math.Max(chunkSize, fileSizeInBytes / blobClient.BlockBlobMaxBlocks);
-                        byte[] buffer = new byte[blockSize];
-
                         var blockList = new List<string>();
+                        var buffer = new byte[chunkSize];
+                        var currentByteIndex = 0L;
+                        var outStream = File.OpenWrite($"{fileName}.tmp");
 
-                        using (var stream = File.OpenRead(fileName))
+                        using (var inStream = File.OpenRead(fileName))
                         {
-                            int readAmount = await stream.ReadAsync(buffer, 0, buffer.Length);
+                            int readAmount = await inStream.ReadAsync(buffer, 0, buffer.Length);
 
                             while (readAmount != 0)
                             {
-                                var blockId = Convert.ToBase64String(Guid.NewGuid().ToByteArray());
-                                blockList.Add(blockId);
-                                await blobClient.StageBlockAsync(blockId, new MemoryStream(buffer), cancellationToken: cancellationToken);
+                                for (int i = 0; i < readAmount; i++)
+                                {
+                                    outStream.WriteByte(buffer[i]);
+                                    currentByteIndex++;
 
-                                readAmount = await stream.ReadAsync(buffer, 0, buffer.Length);
+                                    // We have reached the end of a block
+                                    // close the temp file
+                                    // upload the temp file to storage
+                                    // create a new temp file
+                                    if (currentByteIndex % blockSize == 0)
+                                    {
+                                        await outStream.DisposeAsync();
+                                        blockList.Add(await StageBlockFromFile($"{fileName}.tmp", blobClient, cancellationToken));
+                                        File.Delete($"{fileName}.tmp");
+                                        outStream = File.OpenWrite($"{fileName}.tmp");
+                                    }
+                                }
+
+                                readAmount = await inStream.ReadAsync(buffer, 0, buffer.Length);
+                            }
+
+                            // We have reached the end of the source file
+                            // if we have any more soure file that has yet to be uploaded
+                            // close the temp file
+                            // upload the temp file to storage
+                            if (currentByteIndex % blockSize != 0)
+                            {
+                                await outStream.DisposeAsync();
+                                blockList.Add(await StageBlockFromFile($"{fileName}.tmp", blobClient, cancellationToken));
+                                File.Delete($"{fileName}.tmp");
                             }
                         }
 
@@ -253,6 +284,15 @@ namespace AzDataMaker
             _logger.LogInformation($"Processing Finished {fileCount:N0} files after {stopwatch.Elapsed:ddd\\.hh\\:mm\\:ss} ({(completedBytes / stopwatch.Elapsed.TotalSeconds) * 8:N} Mbps)");
         }
 
+        private async Task<string> StageBlockFromFile(string fileName, BlockBlobClient blobClient, CancellationToken cancellationToken)
+        {
+            using (var stream = File.OpenRead(fileName))
+            {
+                var blockId = Convert.ToBase64String(Guid.NewGuid().ToByteArray());
+                await blobClient.StageBlockAsync(blockId, stream, cancellationToken: cancellationToken);
+                return blockId;
+            }
+        }
 
         private IEnumerable<byte[]> GetChunks(long fileSizeInBytes, long chunkSize, bool randomFileContents)
         {
