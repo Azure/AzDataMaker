@@ -1,7 +1,7 @@
 <Project Sdk="Microsoft.NET.Sdk.Worker">
 
   <PropertyGroup>
-    <TargetFramework>netcoreapp3.1</TargetFramework>
+    <TargetFramework>net5.0</TargetFramework>
     <UserSecretsId>dotnet-AzDataMaker-A2BA7A04-8A10-4531-BABB-F15A0E8491DA</UserSecretsId>
   </PropertyGroup>
 
