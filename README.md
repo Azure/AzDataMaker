@@ -113,10 +113,21 @@ ACRPWD="$(az acr credential show --name $ACR -g $RG --query passwords[0].value -
 # Request authentication information from the storage account
 STORAGEACCTCS="$(az storage account show-connection-string --name $STORAGEACCT -g $RG -o tsv)"
 
-for ((x=1 ; x<=$ACICOUNT ; x++)); 
+# Find the number of currently running Sourcerer instances
+MAXACI=$(az container list -g $RG --query "max([?starts_with(name, '$ACIPREFIX-')].name)" -o tsv)
+
+if [ -z "$MAXACI" ]
+then
+      MAXACI=0
+else
+      MAXACI=${MAXACI:$(expr length "$ACIPREFIX")+1:$(expr length "$MAXACI")-$(expr length "$ACIPREFIX")-1}
+fi
+
+for ((x=MAXACI+1; x<=$ACICOUNT ; x++)); 
 do 
 { 
     ACINAME="$(printf -v x %02d $x; echo "$ACIPREFIX-$x";)"
+    echo "Create $ACINAME"
     az container create \
         --name "$ACINAME" \
         --resource-group $RG \
@@ -142,10 +153,23 @@ do
 } 
 done
 
+# Remove Instances if needed
+# Don’t forget to run the step to recalculate MAXACI and to set ACICOUNT to the correct value
+for ((x=MAXACI ; x>$ACICOUNT ; x--)); 
+do 
+{ 
+    ACINAME="$(printf -v x %02d $x; echo "$ACIPREFIX-$x";)"
+    echo "Delete $ACINAME"
+    az container delete \
+        --name "$ACINAME" \
+        --resource-group $RG \
+        --yes
+} 
+done
 ```
 
 ## Tips
-- To reduce memory consumption the application creates all files on disk first and then uploads them. This can create lots of IO, and depending on the size files you want to create and number of threads you are using, will consume lots of local disk space. When creating larger files reduce the number of threads used.
+- To reduce memory consumption the application creates all files on disk first and then uploads them. This can create lots of IO, and depending on the size files you want to create and number of threads you are using, will consume lots of local disk space. When creating larger files reduce the number of threads used. In the above examples we deploy to ACI, consider deploying to an environment with more local disk space if very large files are required.
 
 
 ## Contributing
