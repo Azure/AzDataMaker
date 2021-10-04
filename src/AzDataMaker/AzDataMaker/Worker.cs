@@ -212,7 +212,7 @@ namespace AzDataMaker
                     //   without using GBs or more of memory
                     else
                     {
-                        var blockSize = Math.Max(chunkSize, Math.Round((fileSizeInBytes / (double)blobClient.BlockBlobMaxBlocks), MidpointRounding.ToPositiveInfinity));
+                        long blockSize = (long)Math.Max(chunkSize, Math.Round((fileSizeInBytes / (double)blobClient.BlockBlobMaxBlocks), MidpointRounding.ToPositiveInfinity));
                         var blockList = new List<string>();
                         var buffer = new byte[chunkSize];
                         var currentByteIndex = 0L;
