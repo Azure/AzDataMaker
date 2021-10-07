@@ -82,8 +82,6 @@ az acr build -g $RG -r $ACR https://github.com/Azure/azdatamaker.git -f src/AzDa
 # To build using a copy of the code you downloaded use this command
 # You will need to be in the AzDataMaker directory for this to work
 az acr build -g $RG -r $ACR . -f src/AzDataMaker/AzDataMaker/Dockerfile --image azdatamaker:latest
-
-
 ```
 
 Create instances of the running app.
@@ -104,7 +102,6 @@ Environment Variables
 
 
 ``` bash
-
 # Request authentication information from container registry
 ACRSVR="$(az acr show --name $ACR -g $RG --query loginServer -o tsv)"
 ACRUSER="$(az acr credential show --name $ACR -g $RG --query username  -o tsv)"
@@ -113,15 +110,9 @@ ACRPWD="$(az acr credential show --name $ACR -g $RG --query passwords[0].value -
 # Request authentication information from the storage account
 STORAGEACCTCS="$(az storage account show-connection-string --name $STORAGEACCT -g $RG -o tsv)"
 
-# Find the number of currently running Sourcerer instances
+# Find the number of currently running instances
 MAXACI=$(az container list -g $RG --query "max([?starts_with(name, '$ACIPREFIX-')].name)" -o tsv)
-
-if [ -z "$MAXACI" ]
-then
-      MAXACI=0
-else
-      MAXACI=${MAXACI:$(expr length "$ACIPREFIX")+1:$(expr length "$MAXACI")-$(expr length "$ACIPREFIX")-1}
-fi
+if [ -z "$MAXACI" ]; then MAXACI=0; else MAXACI=${MAXACI:$(expr length "$ACIPREFIX")+1:$(expr length "$MAXACI")-$(expr length "$ACIPREFIX")-1}; fi
 
 for ((x=MAXACI+1; x<=$ACICOUNT ; x++)); 
 do 
@@ -153,8 +144,11 @@ do
 } 
 done
 
+# Find the number of currently running instances
+MAXACI=$(az container list -g $RG --query "max([?starts_with(name, '$ACIPREFIX-')].name)" -o tsv)
+if [ -z "$MAXACI" ]; then MAXACI=0; else MAXACI=${MAXACI:$(expr length "$ACIPREFIX")+1:$(expr length "$MAXACI")-$(expr length "$ACIPREFIX")-1}; fi
+
 # Remove Instances if needed
-# Don’t forget to run the step to recalculate MAXACI and to set ACICOUNT to the correct value
 for ((x=MAXACI ; x>$ACICOUNT ; x--)); 
 do 
 { 
