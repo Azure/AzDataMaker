@@ -22,6 +22,8 @@ namespace AzDataMaker
             Host.CreateDefaultBuilder(args)
                 .ConfigureServices((hostContext, services) =>
                 {
+                    services.AddSingleton<ConfigHelper>();
+
                     services.AddSingleton(x =>
                     {
                         return new BlobServiceClient(hostContext.Configuration.GetConnectionString("MyStorageConnection"));

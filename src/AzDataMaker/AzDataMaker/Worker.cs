@@ -20,23 +20,28 @@ namespace AzDataMaker
 {
     public class Worker : BackgroundService
     {
+        private const int KiB = 1024;
+        private const int MiB = KiB * 1024;
+        private const int GiB = MiB * 1024;
+        private const long TiB = GiB * 1024L;
+
         private readonly string _name;
         private readonly ILogger<Worker> _logger;
+        private readonly ConfigHelper _config;
         private readonly IHostApplicationLifetime _hostApplicationLifetime;
-        private readonly IConfiguration _configuration;
         private readonly BlobServiceClient _blobServiceClient;
       
 
         public Worker(ILogger<Worker> logger,
             IHostApplicationLifetime hostApplicationLifetime,
-            IConfiguration configuration,
-            BlobServiceClient blobServiceClient)
+            BlobServiceClient blobServiceClient,
+            ConfigHelper config)
         {
             _name = this.GetType().Name;
             _logger = logger;
             _hostApplicationLifetime = hostApplicationLifetime;
-            _configuration = configuration;
             _blobServiceClient = blobServiceClient;
+            _config = config;
         }
 
 
@@ -109,34 +114,35 @@ namespace AzDataMaker
         /// <returns></returns>
         private async Task RunAsync(CancellationToken cancellationToken)
         {
-            Random random = new Random();
             SemaphoreSlim slim = null;
             MD5 md5 = MD5.Create();
 
             // Target containers to round robin over
-            var blobContainerClients = await GetTargetContainersAsync(5, cancellationToken);
+            var blobContainerClients = await _config.GetTargetContainersAsync(5, cancellationToken);
             int containerCount = blobContainerClients.Count();
 
             // How many files should we create
-            int fileCount = GetConfigValue("FileCount", 100);
+            int fileCount = _config.GetConfigValue("FileCount", 100);
 
             // How many threads should we use
-            slim = new SemaphoreSlim(GetConfigValue("Threads", Environment.ProcessorCount * 2));
+            slim = new SemaphoreSlim(_config.GetConfigValue("Threads", Environment.ProcessorCount * 2));
 
             // How many files have we created
             int completedFiles = 0;
-            long completedMB = 0;
+            long completedBytes = 0;
 
-            // Max File Size (in MB)
-            int maxFileSize = GetConfigValue("MaxFileSize", 100);
+            // Max File Size (in MiB)
+            double maxFileSizeMiB = _config.GetConfigValue("MaxFileSize", 100.0);
+            long maxFileSizeBytes = (long)(maxFileSizeMiB * MiB);
 
-            // Min File Size (in MB)
-            int minFileSize = GetConfigValue("MinFileSize", 4);
+            // Min File Size (in MiB)
+            double minFileSizeMiB = _config.GetConfigValue("MinFileSize", 4.0);
+            long minFileSizeBytes = (long)(minFileSizeMiB * MiB);
 
             // How often should I log progress on the upload (in num of files)?
-            int statusIncrement = GetConfigValue("ReportStatusIncrement", 1000);
+            int statusIncrement = _config.GetConfigValue("ReportStatusIncrement", 1000);
 
-            bool randomFileContents = GetConfigValue("RandomFileContents", false);
+            bool randomFileContents = _config.GetConfigValue("RandomFileContents", false);
 
             var stopwatch = new Stopwatch();
             stopwatch.Start();
@@ -145,175 +151,165 @@ namespace AzDataMaker
 
             var uploads = new List<Task>();
 
-            for (int fileNum = 0; fileNum < fileCount; fileNum++)
+            for (int fileNumber = 0; fileNumber < fileCount; fileNumber++)
             {
-
                 slim.Wait();
-
-                int blobContainerIndex = (fileCount - fileNum) % containerCount;
-                string fileName = $"{Guid.NewGuid().ToString().ToLower()}.dat";
-                int fileSizeInMb = random.Next(minFileSize, maxFileSize);
-                long fileSizeInBytes = fileSizeInMb * 1024 * 1024;
-                int blockSize = 8 * 1024;
-                int blocksPerMb = (1024 * 1024) / blockSize;
-
-                // create the file on the local disk
-                // sending it to the disk to allow for creating larger files and
-                // not using all the memory
-                if (randomFileContents)
+                var fileNum = fileNumber;
+                uploads.Add(Task.Run(async () => 
                 {
-                    // create using the random function in .NET
+                    var random = new Random();
+                    int blobContainerIndex = (fileCount - fileNum) % containerCount;
+                    string fileName = $"{Guid.NewGuid().ToString().ToLower()}.dat";
+                    long fileSizeInBytes = random.NextLong(minFileSizeBytes, maxFileSizeBytes);
+                    long chunkSize = 4 * MiB;
+
+                    //A blobClent we are going to use to upload
+                    var blobClient = blobContainerClients[blobContainerIndex].GetBlockBlobClient(fileName);
+
+                    _logger.LogDebug($"Starting File {fileNum:N0} of {fileSizeInBytes:N0} bytes UploadAsync {fileSizeInBytes < blobClient.BlockBlobMaxUploadBlobBytes} ");
+
+
                     using (FileStream fs = File.OpenWrite(fileName))
                     {
-                        byte[] block = new byte[blockSize];
-                        for (int i = 0; i < fileSizeInMb * blocksPerMb; i++)
+                        foreach (var chunk in GetChunks(fileSizeInBytes, chunkSize, randomFileContents))
                         {
-                            random.NextBytes(block);
-                            fs.Write(block, 0, block.Length);
+                            fs.Write(chunk, 0, chunk.Length);
                         }
                     }
-                }
-                else
-                {
-                    // create with an empty file
-                    using (FileStream fs = File.OpenWrite(fileName))
+
+                    // Get a hash of our file
+                    // We are reading the file back to emulate what might happen in a real app
+                    var hash = string.Empty;
+                    using (FileStream fs = File.OpenRead(fileName))
                     {
-                        fs.SetLength(fileSizeInBytes);
+                        hash = Convert.ToBase64String(md5.ComputeHash(fs));
                     }
-                }
 
-                // Get a hash of our file
-                // We are reading the file back to emulate what might happen in a real app
-                var hash = string.Empty;
-                using (FileStream fs = File.OpenRead(fileName))
-                {
-                    hash = Convert.ToBase64String(md5.ComputeHash(fs));
-                }
+                    var metadata = new Dictionary<string, string>()
+                    {
+                        { "Md5Hash", hash },
+                        { "Randomized", randomFileContents.ToString() },
+                        { "FileNum", fileNum.ToString() },
+                        { "FileSize", fileSizeInBytes.ToString() }
+                    };
 
-                //A blobClent we are going to use to upload
-                var blobClient = blobContainerClients[blobContainerIndex].GetBlobClient(fileName);
-
-                var metadata = new Dictionary<string, string>()
-                {
-                    { "Md5Hash", hash },
-                    { "Randomized", randomFileContents.ToString() },
-                    { "FileNum", fileNum.ToString() }
-                };
-
-                //Upload the file and its metadata, then clean up and report status
-                uploads.Add(blobClient.UploadAsync(fileName, metadata: metadata, cancellationToken: cancellationToken)
-                    .ContinueWith(x => {
-                        
-                        File.Delete(fileName);
-
-                        Interlocked.Increment(ref completedFiles);
-                        Interlocked.Add(ref completedMB, fileSizeInMb);
-
-                        if (completedFiles % statusIncrement == 0)
+                    // file is too big for blob storage
+                    if (fileSizeInBytes > (long)blobClient.BlockBlobMaxStageBlockBytes * (long)blobClient.BlockBlobMaxBlocks)
+                    {
+                        throw new ArgumentOutOfRangeException($"File Too Big {fileSizeInBytes:N0} > {blobClient.BlockBlobMaxStageBlockBytes * blobClient.BlockBlobMaxBlocks}");
+                    }
+                    // file is small enough to upload via UploadAsync
+                    else if (fileSizeInBytes < blobClient.BlockBlobMaxUploadBlobBytes)
+                    {
+                        using (var stream = File.OpenRead(fileName))
                         {
-                            var pctComplete = (completedFiles / (double)fileCount);
-                            var mbps = (completedMB / stopwatch.Elapsed.TotalSeconds) * 8;
-                            var eta = TimeSpan.FromSeconds((stopwatch.Elapsed.TotalSeconds / completedFiles) * (fileCount - completedFiles));
-                            _logger.LogInformation($"Processed file {completedFiles:N0} of {fileCount:N0} ({pctComplete * 100:N1}%) after {stopwatch.Elapsed:ddd\\.hh\\:mm\\:ss} ({mbps:N} Mbps) estimated in {eta:ddd\\.hh\\:mm\\:ss}");
+                            await blobClient.UploadAsync(stream, metadata: metadata, cancellationToken: cancellationToken);
+                        }
+                    }
+                    // file is too big to upload via UploadAsync, need to break into blocks and upload individually
+                    //   we do this by reading the source file and writing each block to a new file
+                    //   while this creates more IO to the disk, it will handle files of any size
+                    //   without using GBs or more of memory
+                    else
+                    {
+                        long blockSize = (long)Math.Max(chunkSize, Math.Round((fileSizeInBytes / (double)blobClient.BlockBlobMaxBlocks), MidpointRounding.ToPositiveInfinity));
+                        var blockList = new List<string>();
+                        var buffer = new byte[chunkSize];
+                        var currentByteIndex = 0L;
+                        var outStream = File.OpenWrite($"{fileName}.tmp");
+
+                        using (var inStream = File.OpenRead(fileName))
+                        {
+                            int readAmount = await inStream.ReadAsync(buffer, 0, buffer.Length);
+
+                            while (readAmount != 0)
+                            {
+                                for (int i = 0; i < readAmount; i++)
+                                {
+                                    outStream.WriteByte(buffer[i]);
+                                    currentByteIndex++;
+
+                                    // We have reached the end of a block
+                                    // close the temp file
+                                    // upload the temp file to storage
+                                    // create a new temp file
+                                    if (currentByteIndex % blockSize == 0)
+                                    {
+                                        await outStream.DisposeAsync();
+                                        blockList.Add(await StageBlockFromFile($"{fileName}.tmp", blobClient, cancellationToken));
+                                        File.Delete($"{fileName}.tmp");
+                                        outStream = File.OpenWrite($"{fileName}.tmp");
+                                    }
+                                }
+
+                                readAmount = await inStream.ReadAsync(buffer, 0, buffer.Length);
+                            }
+
+                            // We have reached the end of the source file
+                            // if we have any more soure file that has yet to be uploaded
+                            // close the temp file
+                            // upload the temp file to storage
+                            if (currentByteIndex % blockSize != 0)
+                            {
+                                await outStream.DisposeAsync();
+                                blockList.Add(await StageBlockFromFile($"{fileName}.tmp", blobClient, cancellationToken));
+                                File.Delete($"{fileName}.tmp");
+                            }
                         }
 
-                        slim.Release();
-                    }));
-                
+                        await blobClient.CommitBlockListAsync(blockList, metadata: metadata, cancellationToken: cancellationToken);
+                    }
+
+                    File.Delete(fileName);
+
+                    Interlocked.Increment(ref completedFiles);
+                    Interlocked.Add(ref completedBytes, fileSizeInBytes);
+
+                    if (completedFiles % statusIncrement == 0)
+                    {
+                        var pctComplete = (completedFiles / (double)fileCount);
+                        var mbps = (completedBytes / MiB / stopwatch.Elapsed.TotalSeconds) * 8;
+                        var eta = TimeSpan.FromSeconds((stopwatch.Elapsed.TotalSeconds / completedFiles) * (fileCount - completedFiles));
+                        _logger.LogInformation($"Processed file {completedFiles:N0} of {fileCount:N0} ({pctComplete * 100:N1}%) after {stopwatch.Elapsed:ddd\\.hh\\:mm\\:ss} ({mbps:N} Mbps) estimated in {eta:ddd\\.hh\\:mm\\:ss}");
+                    }
+
+                    _logger.LogDebug($"Finished File {fileNum}");
+
+                    slim.Release();
+                }, cancellationToken));
             }
 
             Task.WaitAll(uploads.ToArray());
 
-            _logger.LogInformation($"Processing Finished {fileCount:N0} files after {stopwatch.Elapsed:ddd\\.hh\\:mm\\:ss} ({(completedMB / stopwatch.Elapsed.TotalSeconds) * 8:N} Mbps)");
+            _logger.LogInformation($"Processing Finished {fileCount:N0} files after {stopwatch.Elapsed:ddd\\.hh\\:mm\\:ss} ({(completedBytes / stopwatch.Elapsed.TotalSeconds) * 8:N} Mbps)");
         }
 
-        /// <summary>
-        /// Helper to get int values from config
-        /// </summary>
-        /// <param name="key"></param>
-        /// <param name="defaultValue"></param>
-        /// <returns></returns>
-        private int GetConfigValue(string key, int defaultValue)
+        private async Task<string> StageBlockFromFile(string fileName, BlockBlobClient blobClient, CancellationToken cancellationToken)
         {
-            string configValue = _configuration[key];
-            int value;
-            if (!int.TryParse(configValue, out value))
+            using (var stream = File.OpenRead(fileName))
             {
-                value = defaultValue;
+                var blockId = Convert.ToBase64String(Guid.NewGuid().ToByteArray());
+                await blobClient.StageBlockAsync(blockId, stream, cancellationToken: cancellationToken);
+                return blockId;
             }
-            return value;
         }
 
-        /// <summary>
-        /// Helper to get bool values from config
-        /// </summary>
-        /// <param name="key"></param>
-        /// <param name="defaultValue"></param>
-        /// <returns></returns>
-        private bool GetConfigValue(string key, bool defaultValue)
+        private IEnumerable<byte[]> GetChunks(long fileSizeInBytes, long chunkSize, bool randomFileContents)
         {
-            string configValue = _configuration[key];
-            bool value;
-            if (!bool.TryParse(configValue, out value))
+            var random = new Random();
+            long currentByteIndex = 0;
+            while (fileSizeInBytes > currentByteIndex)
             {
-                value = defaultValue;
-            }
-            return value;
-        }
+                byte[] chunk = new byte[Math.Min(chunkSize, fileSizeInBytes - currentByteIndex)];
 
-
-        /// <summary>
-        /// Get the target container names from the config option "BlobContainers". 
-        /// 
-        /// The config option can be set with either:
-        /// 
-        ///  - An Integer representing the number of random conatiner names to use. 
-        ///    containers will be named with a GUID.
-        ///    
-        ///  - A comma separated list of container names to use. 
-        /// </summary>
-        /// <returns></returns>
-        private async Task<List<BlobContainerClient>> GetTargetContainersAsync(int defultNumber, CancellationToken cancellationToken)
-        {
-            var blobContainers = new List<BlobContainerClient>();
-
-            string blobContainerConfig = _configuration["BlobContainers"];
-            if (!string.IsNullOrEmpty(blobContainerConfig))
-            {
-                int containerCount = 0;
-                if (int.TryParse(blobContainerConfig, out containerCount))
+                if (randomFileContents)
                 {
-                    // If a number was specified create that many container names
-                    for (int i = 0; i < containerCount; i++)
-                    {
-                        blobContainers.Add(_blobServiceClient.GetBlobContainerClient(Guid.NewGuid().ToString().ToLower()));
-                    }
+                    random.NextBytes(chunk);
                 }
-                else
-                {
-                    // If container names were specified use them
-                    foreach (var name in blobContainerConfig.Split(",").Select(x => x.Trim()).Distinct())
-                    {
-                        blobContainers.Add(_blobServiceClient.GetBlobContainerClient(name));
-                    }
-                }
-            }
-            else
-            {
-                // create the default number of conatiners
-                for (int i = 0; i < defultNumber; i++)
-                {
-                    blobContainers.Add(_blobServiceClient.GetBlobContainerClient(Guid.NewGuid().ToString().ToLower()));
-                }
-            }
 
-            //Ensure all the containers exist
-            foreach (var container in blobContainers)
-            {
-                await container.CreateIfNotExistsAsync(cancellationToken: cancellationToken);
+                currentByteIndex += chunk.Length;
+                yield return chunk;
             }
-
-            return blobContainers;
         }
     }
 }

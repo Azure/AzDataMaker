@@ -1,0 +1,10 @@
+{
+  "profiles": {
+    "AzDataMaker": {
+      "commandName": "Project",
+      "environmentVariables": {
+        "DOTNET_ENVIRONMENT": "Development"
+      }
+    }
+  }
+}

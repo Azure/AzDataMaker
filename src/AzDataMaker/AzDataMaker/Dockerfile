@@ -1,20 +1,13 @@
 #See https://aka.ms/containerfastmode to understand how Visual Studio uses this Dockerfile to build your images for faster debugging.
 
-FROM mcr.microsoft.com/dotnet/core/runtime:3.1-buster-slim AS base
+FROM mcr.microsoft.com/dotnet/sdk:5.0 AS build
 WORKDIR /app
+COPY . ./
 
-FROM mcr.microsoft.com/dotnet/core/sdk:3.1-buster AS build
-WORKDIR /src
-COPY ["AzDataMaker/AzDataMaker.csproj", "AzDataMaker/"]
-RUN dotnet restore "AzDataMaker/AzDataMaker.csproj"
-COPY . .
-WORKDIR "/src/AzDataMaker"
-RUN dotnet build "AzDataMaker.csproj" -c Release -o /app/build
+WORKDIR /app/src/AzDataMaker/AzDataMaker
+RUN dotnet publish -c Release -o out -r linux-musl-x64 --self-contained false 
 
-FROM build AS publish
-RUN dotnet publish "AzDataMaker.csproj" -c Release -o /app/publish
-
-FROM base AS final
+FROM mcr.microsoft.com/dotnet/aspnet:5.0-alpine-amd64
 WORKDIR /app
-COPY --from=publish /app/publish .
+COPY --from=build /app/src/AzDataMaker/AzDataMaker/out ./
 ENTRYPOINT ["dotnet", "AzDataMaker.dll"]
