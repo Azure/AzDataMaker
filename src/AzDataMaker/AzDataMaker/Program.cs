@@ -28,15 +28,22 @@ namespace AzDataMaker
                     services.AddSingleton(x =>
                     {
                         var connectionString = hostContext.Configuration.GetConnectionString("MyStorageConnection");
-                        if (!string.IsNullOrEmpty(connectionString))
+                        if (!string.IsNullOrWhiteSpace(connectionString))
                         {
-                            return new BlobServiceClient(connectionString);
+                            return new BlobServiceClient(connectionString.Trim());
                         }
 
                         var storageAccountUri = hostContext.Configuration["StorageAccountUri"];
-                        if (!string.IsNullOrEmpty(storageAccountUri))
+                        if (!string.IsNullOrWhiteSpace(storageAccountUri))
                         {
-                            return new BlobServiceClient(new Uri(storageAccountUri), new DefaultAzureCredential());
+                            if (!Uri.TryCreate(storageAccountUri.Trim(), UriKind.Absolute, out var storageAccountUriResult))
+                            {
+                                throw new InvalidOperationException(
+                                    "The 'StorageAccountUri' configuration value is not a valid absolute URI. " +
+                                    "Expected format: https://<account>.blob.core.windows.net/.");
+                            }
+
+                            return new BlobServiceClient(storageAccountUriResult, new DefaultAzureCredential());
                         }
 
                         throw new InvalidOperationException(

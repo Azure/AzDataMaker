@@ -164,7 +164,9 @@ do
     ACINAME="$ACIPREFIX-$(printf '%02d' $x)"
     echo "Create $ACINAME"
 
-    # Create the container instance with a system-assigned managed identity
+    # Create the container instance with a system-assigned managed identity.
+    # --no-wait is intentionally omitted: the container must be fully provisioned
+    # before we can read its principalId and create the role assignment.
     az container create \
         --name "$ACINAME" \
         --resource-group $RG \
@@ -176,7 +178,6 @@ do
         --registry-password $ACRPWD \
         --image "$ACRSVR/azdatamaker:latest" \
         --restart-policy Never \
-        --no-wait \
         --assign-identity \
         --environment-variables \
             FileCount="" \
@@ -188,8 +189,14 @@ do
             Threads="" \
             StorageAccountUri=$STORAGEACCTURI
 
+    # Wait until the principal ID is available (identity provisioning may lag slightly)
+    PRINCIPALID=""
+    while [ -z "$PRINCIPALID" ]; do
+        sleep 5
+        PRINCIPALID=$(az container show --name "$ACINAME" -g $RG --query identity.principalId -o tsv)
+    done
+
     # Grant the container's system-assigned identity the Storage Blob Data Contributor role
-    PRINCIPALID=$(az container show --name "$ACINAME" -g $RG --query identity.principalId -o tsv)
     STORAGEACCTID=$(az storage account show --name $STORAGEACCT -g $RG --query id -o tsv)
     az role assignment create \
         --assignee $PRINCIPALID \
