@@ -102,6 +102,8 @@ Environment Variables
 - **StorageAccountUri**: the blob service endpoint URI for the storage account (e.g. `https://<acctname>.blob.core.windows.net/`) (**Option 2: Managed Identity auth**). When this is set, the container instance must have a Managed Identity with the `Storage Blob Data Contributor` role on the target storage account.
 
 > **Authentication options:** Either `ConnectionStrings__MyStorageConnection` or `StorageAccountUri` must be configured. If both are set, the connection string takes precedence.
+>
+> If the target storage account has **shared key access disabled**, connection-string auth will not work even if you can read the account key from the management plane. In that case, use `StorageAccountUri` with Managed Identity.
 
 
 ``` bash
@@ -150,6 +152,53 @@ done
 
 Alternatively, deploy using **Managed Identity** instead of a connection string. This avoids storing storage account keys and is the recommended approach for production workloads.
 
+For Azure Container Instances, a **user-assigned managed identity** is often the most reliable option because you can grant blob access before the container starts. When using a user-assigned identity, also set `AZURE_CLIENT_ID` so `DefaultAzureCredential` selects the intended identity.
+
+``` bash
+# Get the storage account blob endpoint URI
+STORAGEACCTURI="https://${STORAGEACCT}.blob.core.windows.net/"
+
+# Create a user-assigned managed identity in the deployment resource group
+IDENTITY="azdatamaker-id"
+IDENTITYID="$(az identity create -g $RG -n $IDENTITY --query id -o tsv)"
+IDENTITYCLIENTID="$(az identity show -g $RG -n $IDENTITY --query clientId -o tsv)"
+IDENTITYPRINCIPALID="$(az identity show -g $RG -n $IDENTITY --query principalId -o tsv)"
+
+# Grant the identity blob data access before the container starts
+# If the storage account is in a different resource group, replace $RG below with that resource group name.
+STORAGEACCTID="$(az storage account show --name $STORAGEACCT -g $RG --query id -o tsv)"
+az role assignment create \
+    --assignee-object-id $IDENTITYPRINCIPALID \
+    --assignee-principal-type ServicePrincipal \
+    --role "Storage Blob Data Contributor" \
+    --scope $STORAGEACCTID
+
+az container create \
+    --name "${ACIPREFIX}-uami" \
+    --resource-group $RG \
+    --location $REGION \
+    --cpu 1 \
+    --memory 1 \
+    --registry-login-server $ACRSVR \
+    --registry-username $ACRUSER \
+    --registry-password $ACRPWD \
+    --image "$ACRSVR/azdatamaker:latest" \
+    --assign-identity $IDENTITYID \
+    --restart-policy Never \
+    --environment-variables \
+        FileCount="" \
+        MaxFileSize="" \
+        MinFileSize="" \
+        ReportStatusIncrement="" \
+        BlobContainers="" \
+        RandomFileContents="" \
+        Threads="" \
+        StorageAccountUri=$STORAGEACCTURI \
+        AZURE_CLIENT_ID=$IDENTITYCLIENTID
+```
+
+If you prefer not to create a separate identity resource, the following **system-assigned managed identity** flow also works. Be aware that the first run can race the role assignment because the container may start before the permission has propagated.
+
 ``` bash
 # Get the storage account blob endpoint URI
 STORAGEACCTURI="https://${STORAGEACCT}.blob.core.windows.net/"
@@ -197,6 +246,7 @@ do
     done
 
     # Grant the container's system-assigned identity the Storage Blob Data Contributor role
+    # If the storage account is in a different resource group, replace $RG below with that resource group name.
     STORAGEACCTID=$(az storage account show --name $STORAGEACCT -g $RG --query id -o tsv)
     az role assignment create \
         --assignee $PRINCIPALID \
