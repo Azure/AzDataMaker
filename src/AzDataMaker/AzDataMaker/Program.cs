@@ -8,6 +8,7 @@ using Azure.Storage.Blobs;
 using System.Reflection.Metadata;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Azure;
+using Azure.Identity;
 
 namespace AzDataMaker
 {
@@ -26,7 +27,29 @@ namespace AzDataMaker
 
                     services.AddSingleton(x =>
                     {
-                        return new BlobServiceClient(hostContext.Configuration.GetConnectionString("MyStorageConnection"));
+                        var connectionString = hostContext.Configuration.GetConnectionString("MyStorageConnection");
+                        if (!string.IsNullOrWhiteSpace(connectionString))
+                        {
+                            return new BlobServiceClient(connectionString.Trim());
+                        }
+
+                        var storageAccountUri = hostContext.Configuration["StorageAccountUri"];
+                        if (!string.IsNullOrWhiteSpace(storageAccountUri))
+                        {
+                            if (!Uri.TryCreate(storageAccountUri.Trim(), UriKind.Absolute, out var storageAccountUriResult))
+                            {
+                                throw new InvalidOperationException(
+                                    "The 'StorageAccountUri' configuration value is not a valid absolute URI. " +
+                                    "Expected format: https://<account>.blob.core.windows.net/.");
+                            }
+
+                            return new BlobServiceClient(storageAccountUriResult, new DefaultAzureCredential());
+                        }
+
+                        throw new InvalidOperationException(
+                            "Storage account configuration is missing. " +
+                            "Provide either 'ConnectionStrings__MyStorageConnection' (connection string) " +
+                            "or 'StorageAccountUri' (for Managed Identity authentication).");
                     });
 
                     services.AddHostedService<Worker>();
