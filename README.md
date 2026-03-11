@@ -98,7 +98,10 @@ Environment Variables
   - If an number is provided, we will create that many containers using GUIDs as the container names. 
   - If a comma separated list of names is provided, we will use those names
   - If no value is specified then we will create 5 containters with guids as names.
-- **ConnectionStrings__MyStorageConnection**: the connection string to the storage account you want the files created in 
+- **ConnectionStrings__MyStorageConnection**: the connection string to the storage account you want the files created in (**Option 1: Connection String auth**)
+- **StorageAccountUri**: the blob service endpoint URI for the storage account (e.g. `https://<acctname>.blob.core.windows.net/`) (**Option 2: Managed Identity auth**). When this is set, the container instance must have a Managed Identity with the `Storage Blob Data Contributor` role on the target storage account.
+
+> **Authentication options:** Either `ConnectionStrings__MyStorageConnection` or `StorageAccountUri` must be configured. If both are set, the connection string takes precedence.
 
 
 ``` bash
@@ -141,6 +144,57 @@ do
             Threads="" \
         --secure-environment-variables \
             ConnectionStrings__MyStorageConnection=$STORAGEACCTCS 
+} 
+done
+```
+
+Alternatively, deploy using **Managed Identity** instead of a connection string. This avoids storing storage account keys and is the recommended approach for production workloads.
+
+``` bash
+# Get the storage account blob endpoint URI
+STORAGEACCTURI="https://${STORAGEACCT}.blob.core.windows.net/"
+
+# Find the number of currently running instances
+MAXACI=$(az container list -g $RG --query "max([?starts_with(name, '$ACIPREFIX-')].name)" -o tsv)
+if [ -z "$MAXACI" ]; then MAXACI=0; else MAXACI=${MAXACI#$ACIPREFIX-}; fi
+
+for ((x=MAXACI+1; x<=$ACICOUNT ; x++)); 
+do 
+{ 
+    ACINAME="$ACIPREFIX-$(printf '%02d' $x)"
+    echo "Create $ACINAME"
+
+    # Create the container instance with a system-assigned managed identity
+    az container create \
+        --name "$ACINAME" \
+        --resource-group $RG \
+        --location $REGION \
+        --cpu 1 \
+        --memory 1 \
+        --registry-login-server $ACRSVR \
+        --registry-username $ACRUSER \
+        --registry-password $ACRPWD \
+        --image "$ACRSVR/azdatamaker:latest" \
+        --restart-policy Never \
+        --no-wait \
+        --assign-identity \
+        --environment-variables \
+            FileCount="" \
+            MaxFileSize="" \
+            MinFileSize="" \
+            ReportStatusIncrement="" \
+            BlobContainers="" \
+            RandomFileContents="" \
+            Threads="" \
+            StorageAccountUri=$STORAGEACCTURI
+
+    # Grant the container's system-assigned identity the Storage Blob Data Contributor role
+    PRINCIPALID=$(az container show --name "$ACINAME" -g $RG --query identity.principalId -o tsv)
+    STORAGEACCTID=$(az storage account show --name $STORAGEACCT -g $RG --query id -o tsv)
+    az role assignment create \
+        --assignee $PRINCIPALID \
+        --role "Storage Blob Data Contributor" \
+        --scope $STORAGEACCTID
 } 
 done
 

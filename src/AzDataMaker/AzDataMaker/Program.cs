@@ -8,6 +8,7 @@ using Azure.Storage.Blobs;
 using System.Reflection.Metadata;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Azure;
+using Azure.Identity;
 
 namespace AzDataMaker
 {
@@ -26,7 +27,22 @@ namespace AzDataMaker
 
                     services.AddSingleton(x =>
                     {
-                        return new BlobServiceClient(hostContext.Configuration.GetConnectionString("MyStorageConnection"));
+                        var connectionString = hostContext.Configuration.GetConnectionString("MyStorageConnection");
+                        if (!string.IsNullOrEmpty(connectionString))
+                        {
+                            return new BlobServiceClient(connectionString);
+                        }
+
+                        var storageAccountUri = hostContext.Configuration["StorageAccountUri"];
+                        if (!string.IsNullOrEmpty(storageAccountUri))
+                        {
+                            return new BlobServiceClient(new Uri(storageAccountUri), new DefaultAzureCredential());
+                        }
+
+                        throw new InvalidOperationException(
+                            "Storage account configuration is missing. " +
+                            "Provide either 'ConnectionStrings__MyStorageConnection' (connection string) " +
+                            "or 'StorageAccountUri' (for Managed Identity authentication).");
                     });
 
                     services.AddHostedService<Worker>();
